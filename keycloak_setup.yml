@@ -1,0 +1,461 @@
+---
+- name: Setup Keycloak on RHEL for SAML Testing
+  hosts: all
+  become: true
+  gather_facts: false
+  vars:
+#    ansible_user: ec2-user
+#    ansible_ssh_common_args: "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
+    # Keycloak configuration
+    kc_realm: aap
+    kc_test_user: testuser
+    kc_test_user_email: testuser@example.com
+    kc_test_user_first: Test
+    kc_test_user_last: User
+    # AAP Gateway IP (Placeholder is used for SAML client ID if not provided)
+#    aap_gw_ip: ""
+  tasks:
+    - name: Ensure podman is installed
+      dnf:
+        name: podman
+        state: present
+
+    - name: Enable and start podman-restart service
+      systemd:
+        name: podman-restart
+        enabled: true
+        state: started
+
+
+    # =========================================================================
+    # Firewall Configuration
+    # =========================================================================
+    - name: Ensure firewalld is installed and running
+      dnf:
+        name: firewalld
+        state: present
+
+    - name: Ensure firewalld service is enabled and started
+      systemd:
+        name: firewalld
+        enabled: true
+        state: started
+
+    - name: Open port 8080/tcp in firewalld for Keycloak
+      command: firewall-cmd --zone=public --add-port=8080/tcp --permanent
+      register: fw_add
+      changed_when: "'ALREADY_ENABLED' not in fw_add.stderr and 'success' in fw_add.stdout"
+
+    - name: Reload firewalld to apply changes
+      command: firewall-cmd --reload
+      changed_when: fw_add.changed
+
+
+    # Enables non-root user services to run at boot without an active user session
+    - name: Enable linger for ansible_user
+      command: "loginctl enable-linger {{ ansible_user }}"
+      changed_when: false
+    
+    - name: Check if Keycloak container image is already pulled
+      command: podman image exists quay.io/keycloak/keycloak:latest
+      register: image_check
+      ignore_errors: true
+      changed_when: false
+      become: true
+      become_user: "{{ ansible_user }}"
+
+    - name: Pull Keycloak container image
+      command: podman pull quay.io/keycloak/keycloak:latest
+      when: image_check.rc != 0
+      become: true
+      become_user: "{{ ansible_user }}"
+
+    - name: Check if Keycloak container is already running
+      command: podman container exists keycloak
+      register: container_check
+      ignore_errors: true
+      changed_when: false
+      become: true
+      become_user: "{{ ansible_user }}"
+
+    - name: Run Keycloak container in dev mode
+      command: >
+        podman run -d --name keycloak
+        --cgroups=disabled
+        -p 8080:8080
+        -e KC_BOOTSTRAP_ADMIN_USERNAME=admin
+        -e KC_BOOTSTRAP_ADMIN_PASSWORD={{ admin_password }}
+        -e KC_HOSTNAME_STRICT=false
+        -e KC_HTTP_ENABLED=true
+        quay.io/keycloak/keycloak:latest
+        start-dev
+      when: container_check.rc != 0
+      become: true
+      become_user: "{{ ansible_user }}"
+
+    - name: Wait for Keycloak to be ready (health check)
+      uri:
+        url: "http://{{ keycloak_hostname }}:8080/realms/master"
+        status_code: 200
+      register: result
+      until: result.status == 200
+      retries: 30
+      delay: 10
+
+    - name: Disable SSL required for external access in master realm
+      command: >
+        podman exec keycloak /bin/sh -c
+        "/opt/keycloak/bin/kcadm.sh config credentials --server http://{{ keycloak_hostname }}:8080 --realm master --user admin --password '{{ kc_admin_password }}' &&
+         /opt/keycloak/bin/kcadm.sh update realms/master -s sslRequired=NONE"
+      vars:
+        kc_admin_password: "{{ admin_password | default('admin', true) }}"
+      register: kcadm_result
+      changed_when: kcadm_result.rc == 0
+      ignore_errors: true
+      become: true
+      become_user: "{{ ansible_user }}"
+
+    # =========================================================================
+    # Phase 1: Keycloak independent configurations (No AAP info required)
+    # =========================================================================
+
+    - name: "Phase1: Obtain admin access token from master realm"
+      uri:
+        url: "http://{{ keycloak_hostname }}:8080/realms/master/protocol/openid-connect/token"
+        method: POST
+        body_format: form-urlencoded
+        body:
+          client_id: admin-cli
+          username: admin
+          password: "{{ admin_password }}"
+          grant_type: password
+        status_code: 200
+      register: token_result
+
+    - name: Set access token fact
+      set_fact:
+        kc_token: "{{ token_result.json.access_token }}"
+
+    # --- Create Realm ---
+    - name: "Phase1: Check if realm '{{ kc_realm }}' already exists"
+      uri:
+        url: "http://{{ keycloak_hostname }}:8080/admin/realms/{{ kc_realm }}"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ kc_token }}"
+        status_code: [200, 404]
+      register: realm_check
+
+    - name: "Phase1: Create realm '{{ kc_realm }}'"
+      uri:
+        url: "http://{{ keycloak_hostname }}:8080/admin/realms"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ kc_token }}"
+          Content-Type: application/json
+        body_format: json
+        body:
+          realm: "{{ kc_realm }}"
+          enabled: true
+          sslRequired: "NONE"
+        status_code: [201]
+      when: realm_check.status == 404
+
+    # --- Create Test User ---
+    - name: "Phase1: Check if test user '{{ kc_test_user }}' already exists"
+      uri:
+        url: "http://{{ keycloak_hostname }}:8080/admin/realms/{{ kc_realm }}/users?username={{ kc_test_user }}&exact=true"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ kc_token }}"
+        status_code: 200
+      register: user_check
+
+    - name: "Phase1: Create test user '{{ kc_test_user }}'"
+      uri:
+        url: "http://{{ keycloak_hostname }}:8080/admin/realms/{{ kc_realm }}/users"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ kc_token }}"
+          Content-Type: application/json
+        body_format: json
+        body:
+          username: "{{ kc_test_user }}"
+          enabled: true
+          emailVerified: true
+          firstName: "{{ kc_test_user_first }}"
+          lastName: "{{ kc_test_user_last }}"
+          email: "{{ kc_test_user_email }}"
+          credentials:
+            - type: password
+              value: "{{ admin_password }}"
+              temporary: false
+        status_code: [201]
+      when: user_check.json | length == 0
+
+    # =========================================================================
+    # Phase 2: Configure SAML client using AAP information
+    # If aap_gw_ip is empty, placeholder values will be used.
+    # =========================================================================
+
+    - name: Set SAML client ID and URLs
+      set_fact:
+        saml_client_id: "saml_entity"
+        saml_acs_url: "{{ 'https://' + aap_gw_ip + '/sso/complete/saml/' if aap_gw_ip | length > 0 else 'https://AAP_GATEWAY_IP_PLACEHOLDER/sso/complete/saml/' }}"
+        saml_redirect_uri: "{{ 'https://' + aap_gw_ip + '/*' if aap_gw_ip | length > 0 else 'https://AAP_GATEWAY_IP_PLACEHOLDER/*' }}"
+
+    # --- Re-obtain token (original token might have expired) ---
+    - name: "Phase2: Re-obtain admin access token"
+      uri:
+        url: "http://{{ keycloak_hostname }}:8080/realms/master/protocol/openid-connect/token"
+        method: POST
+        body_format: form-urlencoded
+        body:
+          client_id: admin-cli
+          username: admin
+          password: "{{ admin_password }}"
+          grant_type: password
+        status_code: 200
+      register: token_result2
+
+    - name: Update access token fact
+      set_fact:
+        kc_token: "{{ token_result2.json.access_token }}"
+
+    # --- Create SAML Client ---
+    - name: "Phase2: Check if SAML client already exists"
+      uri:
+        url: "http://{{ keycloak_hostname }}:8080/admin/realms/{{ kc_realm }}/clients?clientId={{ saml_client_id | urlencode }}"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ kc_token }}"
+        status_code: 200
+      register: client_check
+
+    - name: "Phase2: Create SAML client for AAP"
+      uri:
+        url: "http://{{ keycloak_hostname }}:8080/admin/realms/{{ kc_realm }}/clients"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ kc_token }}"
+          Content-Type: application/json
+        body_format: json
+        body:
+          clientId: "{{ saml_client_id }}"
+          protocol: saml
+          enabled: true
+          publicClient: false
+          frontchannelLogout: true
+          redirectUris:
+            - "{{ saml_redirect_uri }}"
+          adminUrl: "{{ saml_acs_url }}"
+          attributes:
+            saml.authnstatement: "true"
+            saml.server.signature: "true"
+            saml.assertion.signature: "true"
+            saml.client.signature: "false"
+            saml.encrypt: "false"
+            saml.force.post.binding: "true"
+            saml_name_id_format: "username"
+            saml.assertion.consumer.url.post: "{{ saml_acs_url }}"
+            saml.single.logout.service.url.post: "{{ saml_acs_url }}"
+        status_code: [201]
+      when: client_check.json | length == 0
+      register: client_create_result
+
+    # --- Get Client UUID ---
+    - name: "Phase2: Get SAML client UUID"
+      uri:
+        url: "http://{{ keycloak_hostname }}:8080/admin/realms/{{ kc_realm }}/clients?clientId={{ saml_client_id | urlencode }}"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ kc_token }}"
+        status_code: 200
+      register: client_info
+
+    - name: Set client UUID fact
+      set_fact:
+        saml_client_uuid: "{{ client_info.json[0].id }}"
+      when: client_info.json | length > 0
+
+    # --- Protocol Mapper: email ---
+    - name: "Phase2: Create protocol mapper - email"
+      uri:
+        url: "http://{{ keycloak_hostname }}:8080/admin/realms/{{ kc_realm }}/clients/{{ saml_client_uuid }}/protocol-mappers/models"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ kc_token }}"
+          Content-Type: application/json
+        body_format: json
+        body:
+          name: "X500 email"
+          protocol: saml
+          protocolMapper: "saml-user-property-mapper"
+          consentRequired: false
+          config:
+            user.attribute: "email"
+            friendly.name: "email"
+            attribute.name: "email"
+            attribute.nameformat: "Basic"
+        status_code: [201, 409]
+      when: saml_client_uuid is defined
+      ignore_errors: true
+
+    # --- Protocol Mapper: firstName ---
+    - name: "Phase2: Create protocol mapper - firstName"
+      uri:
+        url: "http://{{ keycloak_hostname }}:8080/admin/realms/{{ kc_realm }}/clients/{{ saml_client_uuid }}/protocol-mappers/models"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ kc_token }}"
+          Content-Type: application/json
+        body_format: json
+        body:
+          name: "X500 givenName"
+          protocol: saml
+          protocolMapper: "saml-user-property-mapper"
+          consentRequired: false
+          config:
+            user.attribute: "firstName"
+            friendly.name: "first_name"
+            attribute.name: "first_name"
+            attribute.nameformat: "Basic"
+        status_code: [201, 409]
+      when: saml_client_uuid is defined
+      ignore_errors: true
+
+    # --- Protocol Mapper: lastName ---
+    - name: "Phase2: Create protocol mapper - lastName"
+      uri:
+        url: "http://{{ keycloak_hostname }}:8080/admin/realms/{{ kc_realm }}/clients/{{ saml_client_uuid }}/protocol-mappers/models"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ kc_token }}"
+          Content-Type: application/json
+        body_format: json
+        body:
+          name: "X500 surname"
+          protocol: saml
+          protocolMapper: "saml-user-property-mapper"
+          consentRequired: false
+          config:
+            user.attribute: "lastName"
+            friendly.name: "last_name"
+            attribute.name: "last_name"
+            attribute.nameformat: "Basic"
+        status_code: [201, 409]
+      when: saml_client_uuid is defined
+      ignore_errors: true
+
+    # --- Protocol Mapper: username ---
+    - name: "Phase2: Create protocol mapper - username"
+      uri:
+        url: "http://{{ keycloak_hostname }}:8080/admin/realms/{{ kc_realm }}/clients/{{ saml_client_uuid }}/protocol-mappers/models"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ kc_token }}"
+          Content-Type: application/json
+        body_format: json
+        body:
+          name: "X500 username"
+          protocol: saml
+          protocolMapper: "saml-user-property-mapper"
+          consentRequired: false
+          config:
+            user.attribute: "username"
+            friendly.name: "username"
+            attribute.name: "username"
+            attribute.nameformat: "Basic"
+        status_code: [201, 409]
+      when: saml_client_uuid is defined
+      ignore_errors: true
+
+    # =========================================================================
+    # Remove default 'role_list' client scope to prevent duplicate SAML attributes
+    # =========================================================================
+
+    - name: "Phase2: Get default client scopes attached to SAML client"
+      uri:
+        url: "http://{{ keycloak_hostname }}:8080/admin/realms/{{ kc_realm }}/clients/{{ saml_client_uuid }}/default-client-scopes"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ kc_token }}"
+        status_code: 200
+      register: default_scopes
+      when: saml_client_uuid is defined
+
+    - name: "Phase2: Find 'role_list' scope ID"
+      set_fact:
+        role_list_scope_id: "{{ (default_scopes.json | selectattr('name', 'equalto', 'role_list') | map(attribute='id') | list | first) | default('') }}"
+      when: default_scopes.json is defined
+
+    - name: "Phase2: Remove 'role_list' scope from SAML client"
+      uri:
+        url: "http://{{ keycloak_hostname }}:8080/admin/realms/{{ kc_realm }}/clients/{{ saml_client_uuid }}/default-client-scopes/{{ role_list_scope_id }}"
+        method: DELETE
+        headers:
+          Authorization: "Bearer {{ kc_token }}"
+        status_code: [204, 404]
+      when: 
+        - saml_client_uuid is defined
+        - role_list_scope_id | length > 0
+
+    # =========================================================================
+    # Pre-generate SP Certificate and Private Key (for AAP authentication configuration)
+    # =========================================================================
+
+    - name: "Phase2: Check if SP certificate already exists"
+      stat:
+        path: /home/{{ansible_user}}/saml_sp_cert.pem
+      register: sp_cert_stat
+      become: false
+
+    - name: "Phase2: Generate SP certificate and private key for AAP SAML authenticator"
+      command: >
+        openssl req -x509 -newkey rsa:4096
+        -keyout /home/{{ansible_user}}/saml_sp_key.pem
+        -out /home/{{ansible_user}}/saml_sp_cert.pem
+        -sha256 -days 3650 -nodes
+        -subj "/CN=AAP SAML SP"
+      become: false
+      when: not sp_cert_stat.stat.exists
+
+    # =========================================================================
+    # Get Keycloak Realm RSA Public Key (for AAP IdP Public Cert configuration)
+    # =========================================================================
+
+    - name: "Phase2: Get Keycloak realm keys"
+      uri:
+        url: "http://{{ keycloak_hostname }}:8080/admin/realms/{{ kc_realm }}/keys"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ kc_token }}"
+        status_code: 200
+      register: realm_keys
+
+    - name: Extract RSA certificate from realm keys
+      set_fact:
+        kc_idp_cert: "{{ realm_keys.json['keys'] | selectattr('type', 'equalto', 'RSA') | selectattr('certificate', 'defined') | map(attribute='certificate') | first }}"
+      ignore_errors: true
+
+    # =========================================================================
+    # Save configuration info to file (for CLI consumption)
+    # =========================================================================
+
+    - name: "Save SAML configuration summary to file"
+      copy:
+        dest: /home/{{ansible_user}}/saml_config_summary.json
+        content: |
+          {
+            "realm": "{{ kc_realm }}",
+            "test_user": "{{ kc_test_user }}",
+            "saml_client_id": "{{ saml_client_id }}",
+            "saml_acs_url": "{{ saml_acs_url }}",
+            "idp_login_url": "http://{{ keycloak_hostname }}:8080/realms/{{ kc_realm }}/protocol/saml",
+            "idp_entity_id": "http://{{ keycloak_hostname }}:8080/realms/{{ kc_realm }}",
+            "idp_cert": "{{ kc_idp_cert | default('UNAVAILABLE') }}",
+            "aap_gw_ip_configured": "{{ 'true' if aap_gw_ip | length > 0 else 'false' }}"
+          }
+        owner: "{{ansible_user}}"
+        mode: '0644'
+      become: false

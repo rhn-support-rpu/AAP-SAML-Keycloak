@@ -1,0 +1,269 @@
+---
+# Phase 3: Configure SAML Authenticator on AAP and sync ACS URL back to Keycloak
+# Runs on localhost, accesses AAP Gateway API and Keycloak Admin API remotely.
+#
+# Required variables:
+#   aap_host          - AAP Gateway IP or FQDN
+#   aap_admin_password - AAP admin password
+#   keycloak_ip       - Keycloak public IP
+#   key_path          - Path to SSH private key for Keycloak node access
+
+- name: Configure SAML on AAP Gateway and sync with Keycloak
+  hosts: all
+  #connection: local
+  gather_facts: false
+  vars:
+    aap_hostname: "{{aap_gw_ip}}"
+    aap_username: "admin"
+    aap_password: "{{aap_admin_password}}"
+    aap_validate_certs: false
+    kc_realm: aap
+    sp_entity_id: "saml_entity"
+    saml_auth_name: "SAML (Keycloak)"
+    keycloak_ip: "{{keycloak_hostname}}"
+
+  tasks:
+    # =========================================================================
+    # Step 1: Fetch SP certificate and private key from Keycloak node
+    # =========================================================================
+
+    - name: "Step1: Read SP public certificate from Keycloak node"
+      command: >
+        cat /home/{{ansible_user}}/saml_sp_cert.pem
+      register: sp_cert_raw
+      changed_when: false
+
+    - name: "Step1: Read SP private key from Keycloak node"
+      command: >
+        cat /home/{{ansible_user}}/saml_sp_key.pem
+      register: sp_key_raw
+      changed_when: false
+
+    - name: Set SP cert/key facts
+      set_fact:
+        sp_public_cert: "{{ sp_cert_raw.stdout }}"
+        sp_private_key: "{{ sp_key_raw.stdout }}"
+
+    # =========================================================================
+    # Step 2: Get IdP public certificate from Keycloak Admin API
+    # =========================================================================
+
+    - name: "Step2: Obtain Keycloak admin access token"
+      uri:
+        url: "http://{{ keycloak_ip }}:8080/realms/master/protocol/openid-connect/token"
+        method: POST
+        body_format: form-urlencoded
+        body:
+          client_id: admin-cli
+          username: admin
+          password: "{{ aap_admin_password }}"
+          grant_type: password
+        status_code: 200
+      register: kc_token_result
+
+    - name: Set Keycloak token fact
+      set_fact:
+        kc_token: "{{ kc_token_result.json.access_token }}"
+
+    - name: "Step2: Get Keycloak realm keys"
+      uri:
+        url: "http://{{ keycloak_ip }}:8080/admin/realms/{{ kc_realm }}/keys"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ kc_token }}"
+        status_code: 200
+      register: realm_keys
+
+    - name: Extract RSA certificate from realm keys
+      set_fact:
+        kc_idp_cert_raw: "{{ realm_keys.json['keys'] | selectattr('type', 'equalto', 'RSA') | selectattr('certificate', 'defined') | map(attribute='certificate') | first }}"
+
+    - name: Format IdP certificate with PEM headers
+      set_fact:
+        kc_idp_cert: |
+          -----BEGIN CERTIFICATE-----
+          {{ kc_idp_cert_raw }}
+          -----END CERTIFICATE-----
+
+    # =========================================================================
+    # Step 3: Wait for AAP Gateway API and create SAML Authenticator
+    # =========================================================================
+
+    - name: "Step3: Wait for AAP Gateway API to be available"
+      uri:
+        url: "https://{{ aap_hostname }}/api/gateway/v1/authenticators/"
+        method: GET
+        user: "{{ aap_username }}"
+        password: "{{ aap_password }}"
+        validate_certs: false
+        status_code: 200
+        force_basic_auth: yes
+      register: _result
+      until: _result.status == 200
+      retries: 30
+      delay: 10
+      ignore_errors: true
+
+    - name: "Step3: Check for existing SAML authenticator"
+      uri:
+        url: "https://{{ aap_hostname }}/api/gateway/v1/authenticators/?name={{ saml_auth_name | urlencode }}"
+        method: GET
+        user: "{{ aap_username }}"
+        password: "{{ aap_password }}"
+        validate_certs: false
+        force_basic_auth: yes
+        return_content: yes
+      register: _existing_saml
+
+    - name: "Step3: Delete existing SAML authenticator to apply new configuration"
+      uri:
+        url: "https://{{ aap_hostname }}/api/gateway/v1/authenticators/{{ _existing_saml.json.results[0].id }}/"
+        method: DELETE
+        user: "{{ aap_username }}"
+        password: "{{ aap_password }}"
+        validate_certs: false
+        force_basic_auth: yes
+        status_code: [204, 404]
+      when: _existing_saml.json is defined and _existing_saml.json.count > 0
+
+    - name: "Step3: Create SAML Authenticator via AAP Gateway API"
+      uri:
+        url: "https://{{ aap_hostname }}/api/gateway/v1/authenticators/"
+        method: POST
+        user: "{{ aap_username }}"
+        password: "{{ aap_password }}"
+        validate_certs: false
+        force_basic_auth: yes
+        body_format: json
+        status_code: 201
+        body:
+          name: "{{ saml_auth_name }}"
+          type: "ansible_base.authentication.authenticator_plugins.saml"
+          enabled: true
+          create_objects: true
+          remove_users: false
+          configuration:
+            SP_ENTITY_ID: "{{ sp_entity_id }}"
+            SP_PUBLIC_CERT: "{{ sp_public_cert }}"
+            SP_PRIVATE_KEY: "{{ sp_private_key }}"
+            IDP_URL: "http://{{ keycloak_ip }}:8080/realms/{{ kc_realm }}/protocol/saml"
+            IDP_ENTITY_ID: "http://{{ keycloak_ip }}:8080/realms/{{ kc_realm }}"
+            IDP_X509_CERT: "{{ kc_idp_cert }}"
+            IDP_ATTR_EMAIL: "email"
+            IDP_ATTR_USERNAME: "username"
+            IDP_ATTR_FIRST_NAME: "first_name"
+            IDP_ATTR_LAST_NAME: "last_name"
+            IDP_ATTR_USER_PERMANENT_ID: "name_id"
+            ORG_INFO:
+              en-US:
+                url: "http://www.example.com"
+                name: "example"
+                displayname: "Example"
+            TECHNICAL_CONTACT:
+              givenName: "Admin"
+              emailAddress: "admin@example.com"
+            SUPPORT_CONTACT:
+              givenName: "Admin"
+              emailAddress: "admin@example.com"
+            SP_EXTRA:
+              requestedAuthnContext: false
+            SECURITY_CONFIG: {}
+      register: saml_create_result
+
+    # =========================================================================
+    # Step 4: Extract Callback URL and update Keycloak SAML Client
+    # =========================================================================
+
+    - name: "Step4: Get created SAML authenticator details"
+      uri:
+        url: "https://{{ aap_hostname }}/api/gateway/v1/authenticators/?name={{ saml_auth_name | urlencode }}"
+        method: GET
+        user: "{{ aap_username }}"
+        password: "{{ aap_password }}"
+        validate_certs: false
+        force_basic_auth: yes
+        return_content: yes
+      register: saml_auth_info
+
+    - name: Set SAML authenticator facts
+      set_fact:
+        saml_callback_url: "{{ saml_auth_info.json.results[0].configuration.CALLBACK_URL }}"
+        saml_slug: "{{ saml_auth_info.json.results[0].slug }}"
+      when: saml_auth_info.json.results | length > 0
+
+    - name: Display auto-generated SAML callback URL
+      debug:
+        msg: "AAP SAML Callback URL: {{ saml_callback_url }}"
+      when: saml_callback_url is defined
+
+    # --- Re-obtain Keycloak token (may have expired) ---
+    - name: "Step4: Re-obtain Keycloak admin access token"
+      uri:
+        url: "http://{{ keycloak_ip }}:8080/realms/master/protocol/openid-connect/token"
+        method: POST
+        body_format: form-urlencoded
+        body:
+          client_id: admin-cli
+          username: admin
+          password: "{{ aap_admin_password }}"
+          grant_type: password
+        status_code: 200
+      register: kc_token_result2
+
+    - name: Update Keycloak token fact
+      set_fact:
+        kc_token: "{{ kc_token_result2.json.access_token }}"
+
+    # --- Get SAML Client UUID from Keycloak ---
+    - name: "Step4: Get SAML client from Keycloak"
+      uri:
+        url: "http://{{ keycloak_ip }}:8080/admin/realms/{{ kc_realm }}/clients?clientId={{ sp_entity_id | urlencode }}"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ kc_token }}"
+        status_code: 200
+      register: kc_client_info
+
+    - name: Set Keycloak SAML client UUID
+      set_fact:
+        kc_saml_client_uuid: "{{ kc_client_info.json[0].id }}"
+      when: kc_client_info.json | length > 0
+
+    # --- Update Keycloak SAML Client with actual ACS URL ---
+    - name: "Step4: Update Keycloak SAML client with AAP Callback URL"
+      uri:
+        url: "http://{{ keycloak_ip }}:8080/admin/realms/{{ kc_realm }}/clients/{{ kc_saml_client_uuid }}"
+        method: PUT
+        headers:
+          Authorization: "Bearer {{ kc_token }}"
+          Content-Type: application/json
+        body_format: json
+        body:
+          clientId: "{{ sp_entity_id }}"
+          protocol: saml
+          enabled: true
+          publicClient: false
+          frontchannelLogout: true
+          redirectUris:
+            - "https://{{ aap_hostname }}/*"
+          adminUrl: "{{ saml_callback_url }}"
+          attributes:
+            saml.authnstatement: "true"
+            saml.server.signature: "true"
+            saml.assertion.signature: "true"
+            saml.client.signature: "false"
+            saml.encrypt: "false"
+            saml.force.post.binding: "true"
+            saml_name_id_format: "username"
+            saml.assertion.consumer.url.post: "{{ saml_callback_url }}"
+            saml.single.logout.service.url.post: "{{ saml_callback_url }}"
+        status_code: [204]
+      when: kc_saml_client_uuid is defined and saml_callback_url is defined
+
+    - name: Display SAML integration summary
+      debug:
+        msg: >
+          SAML integration complete.
+          AAP Callback URL: {{ saml_callback_url | default('N/A') }},
+          Keycloak Client UUID: {{ kc_saml_client_uuid | default('N/A') }},
+          SP Entity ID: {{ sp_entity_id }}
