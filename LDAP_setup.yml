@@ -1,0 +1,172 @@
+---
+- name: Setup OpenLDAP Container on RHEL
+  hosts: all
+  become: true
+  gather_facts: false
+  vars:
+    ldap_domain: "example.com"
+    ldap_base_dn: "dc=example,dc=com"
+    ldap_admin_username: "admin"
+    ldap_test_user: "testuser1"
+    ldap_test_user_password: "{{ BIND_PASSWORD }}"
+    ldap_test_group: "testgroup1"
+
+  tasks:
+    - name: Ensure podman is installed
+      dnf:
+        name: podman
+        state: present
+
+    - name: Ensure firewalld is installed and running
+      dnf:
+        name: firewalld
+        state: present
+
+    - name: Open port 3890/tcp in firewalld for OpenLDAP
+      command: firewall-cmd --zone=public --add-port=3890/tcp --permanent
+      register: fw_add
+      changed_when: "'ALREADY_ENABLED' not in fw_add.stderr and 'success' in fw_add.stdout"
+
+    - name: Reload firewalld to apply changes
+      command: firewall-cmd --reload
+      changed_when: fw_add.changed
+
+    - name: Enable linger for ansible_user
+      command: "loginctl enable-linger {{ ansible_user }}"
+      changed_when: false
+
+    # =========================================================================
+    # Podman Container Deployment (Rootless)
+    # =========================================================================
+
+    - name: Check if OpenLDAP container image is already pulled
+      command: podman image exists docker.io/osixia/openldap:1.5.0
+      register: image_check
+      ignore_errors: true
+      changed_when: false
+      become: true
+      become_user: "{{ ansible_user }}"
+
+    - name: Pull OpenLDAP container image
+      command: podman pull docker.io/osixia/openldap:1.5.0
+      when: image_check.rc != 0
+      become: true
+      become_user: "{{ ansible_user }}"
+
+    - name: Check if OpenLDAP container is already running
+      command: podman inspect -f '{{ "{{ .State.Running }}" }}' openldap
+      register: container_running
+      ignore_errors: true
+      changed_when: false
+      become: true
+      become_user: "{{ ansible_user }}"
+
+    - name: Run OpenLDAP container
+      command: >
+        podman run -d --name openldap
+        -p 3890:389
+        -e LDAP_ORGANISATION="Example Inc"
+        -e LDAP_DOMAIN={{ ldap_domain }}
+        -e LDAP_ADMIN_PASSWORD={{ BIND_PASSWORD }}
+        docker.io/osixia/openldap:1.5.0
+      when: container_running.rc != 0 or container_running.stdout != "true"
+      become: true
+      become_user: "{{ ansible_user }}"
+
+    # =========================================================================
+    # Auto-Restart Configuration (Systemd Integration)
+    # =========================================================================
+
+    - name: Create systemd user directory for ansible_user
+      file:
+        path: "/home/{{ ansible_user }}/.config/systemd/user"
+        state: directory
+        owner: "{{ ansible_user }}"
+        mode: '0755'
+      become: true
+      become_user: "{{ ansible_user }}"
+
+    - name: Generate user systemd service for OpenLDAP
+      command: podman generate systemd --name openldap --files
+      args:
+        chdir: "/home/{{ ansible_user }}/.config/systemd/user/"
+        creates: "/home/{{ ansible_user }}/.config/systemd/user/container-openldap.service"
+      become: true
+      become_user: "{{ ansible_user }}"
+
+    - name: Enable container-openldap systemd user service
+      systemd:
+        name: container-openldap
+        enabled: true
+        scope: user
+      become: true
+      become_user: "{{ ansible_user }}"
+
+    # =========================================================================
+    # LDAP Readiness Check & Initial Seed (User/Group Creation)
+    # =========================================================================
+
+    - name: Ensure openldap-clients tool is installed locally
+      dnf:
+        name: openldap-clients
+        state: present
+
+    - name: Wait for LDAP server to start responding
+      command: >
+        ldapsearch -x -H ldap://127.0.0.1:3890
+        -b "{{ ldap_base_dn }}"
+        -D "cn={{ ldap_admin_username }},{{ ldap_base_dn }}"
+        -w "{{ BIND_PASSWORD }}"
+      register: ldap_ping
+      until: ldap_ping.rc == 0
+      retries: 5
+      delay: 10
+      changed_when: false
+
+    - name: Create LDIF file for initial test structure
+      copy:
+        dest: "/tmp/init_ldap.ldif"
+        content: |
+          # Create Organizational Unit
+          dn: ou=users,{{ ldap_base_dn }}
+          objectClass: organizationalUnit
+          ou: users
+
+          # Create Group
+          dn: cn={{ ldap_test_group }},ou=users,{{ ldap_base_dn }}
+          objectClass: posixGroup
+          cn: {{ ldap_test_group }}
+          gidNumber: 10001
+
+          # Create User
+          dn: cn={{ ldap_test_user }},ou=users,{{ ldap_base_dn }}
+          objectClass: inetOrgPerson
+          objectClass: posixAccount
+          objectClass: shadowAccount
+          cn: {{ ldap_test_user }}
+          sn: User1
+          givenName: Test
+          uid: {{ ldap_test_user }}
+          uidNumber: 10001
+          gidNumber: 10001
+          homeDirectory: /home/{{ ldap_test_user }}
+          userPassword: {{ ldap_test_user_password }}
+          mail: {{ ldap_test_user }}@{{ ldap_domain }}
+        mode: '0600'
+
+    - name: Populate LDAP with test group and test user
+      command: >
+        ldapadd -x -H ldap://127.0.0.1:3890
+        -D "cn={{ ldap_admin_username }},{{ ldap_base_dn }}"
+        -w "{{ BIND_PASSWORD }}"
+        -f /tmp/init_ldap.ldif
+      register: ldap_add_result
+      failed_when:
+        - ldap_add_result.rc != 0
+        - "'Already exists' not in ldap_add_result.stderr"
+      changed_when: ldap_add_result.rc == 0
+
+    - name: Clean up temporary LDIF file
+      file:
+        path: "/tmp/init_ldap.ldif"
+        state: absent
