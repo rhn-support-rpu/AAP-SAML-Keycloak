@@ -22,6 +22,6 @@ keycloak_hostname=<host that you plan to deploy keycloak>
 admin_password=<password>
 
 # LDAP Configuration
-BIND_PASSWORD=aap3211!
+BIND_PASSWORD=<password for admin and testuser1>
 
 
