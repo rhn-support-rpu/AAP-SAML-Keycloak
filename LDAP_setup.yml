@@ -137,6 +137,7 @@
           objectClass: posixGroup
           cn: {{ ldap_test_group }}
           gidNumber: 10001
+          memberUid: {{ ldap_test_user }}
 
           # Create User
           dn: cn={{ ldap_test_user }},ou=users,{{ ldap_base_dn }}
